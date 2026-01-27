@@ -3551,13 +3551,32 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         logger.error(
                             f"ACLgraph sizes capture fail: {type(e).__name__}:\n"
                             "ACLgraph has insufficient available streams to capture the configured number of sizes. "
-                            "Please verify both the availability of adequate streams and the appropriateness of the configured size count.\n\n"
-                            "Recommended solutions:\n"
-                            "1. Manually configure the compilation_config parameter "
-                            "with a reduced set of sizes: '{\"cudagraph_capture_sizes\":[size1, size2, size3, ...]}'.\n"
-                            "2. Utilize ACLgraph's full graph mode as an alternative to the piece-wise approach.\n\n"
+                            "Trying with reduced number of sizes...\n\n"
                             f"{str(e)}")
-                    raise
+                        
+                        # Try with fewer sizes to reduce resource usage
+                        try:
+                            # Use only every 4th size to reduce resource consumption
+                            reduced_compilation_cases = [size for i, size in enumerate(compilation_cases) if i % 4 == 0]
+                            if not reduced_compilation_cases:
+                                # Ensure at least one size is present
+                                reduced_compilation_cases = [compilation_cases[0]] if compilation_cases else []
+                            
+                            logger.info(f"Retrying ACL graph capture with reduced sizes: {reduced_compilation_cases}")
+                            
+                            self._capture_aclgraphs(
+                                reduced_compilation_cases,
+                                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                                uniform_decode=False)
+                                
+                            logger.info("Successfully captured ACL graphs with reduced sizes")
+                        except Exception as retry_error:
+                            logger.error(
+                                f"ACL graph capture failed even with reduced sizes: {type(retry_error).__name__}:\n"
+                                f"{str(retry_error)}")
+                            raise
+                    else:
+                        raise
 
             if aclgraph_mode.decode_mode() == CUDAGraphMode.FULL and \
                 aclgraph_mode.separate_routine():

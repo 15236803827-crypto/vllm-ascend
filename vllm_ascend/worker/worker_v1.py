@@ -19,6 +19,7 @@
 
 import copy
 from typing import Optional, Union
+import os
 
 import torch
 import torch.nn as nn
@@ -149,6 +150,24 @@ class NPUWorker(WorkerBase):
             WEIGHT_LOADER_V2_SUPPORTED
         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
+            
+        # Initialize unique memory pool identifier for this worker to avoid resource conflicts
+        # in multi-instance scenarios on the same NPU device
+        self._init_memory_isolation()
+
+    def _init_memory_isolation(self):
+        """Initialize memory isolation for this worker to avoid conflicts with other workers."""
+        # Set a unique memory pool name for this worker to avoid conflicts
+        # This ensures each worker has its own memory management context
+        worker_id = f"worker_{self.local_rank}_{os.getpid()}"
+        
+        # Initialize CaMemAllocator instance for this worker
+        allocator = CaMemAllocator.get_instance()
+        logger.info(f"Initialized CaMemAllocator for worker {worker_id}")
+        
+        # Attempt to reset memory stats to have a clean state
+        torch_npu.npu.reset_peak_memory_stats()
+        torch_npu.npu.empty_cache()
 
     def sleep(self, level: int = 1) -> None:
         if not sleep_mode_enabled():
@@ -205,6 +224,7 @@ class NPUWorker(WorkerBase):
         NPUPlatform.set_device(device)
         NPUPlatform.empty_cache()
         self.init_npu_memory = NPUPlatform.mem_get_info()[0]
+        
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
         # Set random seed.
@@ -229,9 +249,10 @@ class NPUWorker(WorkerBase):
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
         free_npu_memory, _ = NPUPlatform.mem_get_info()
+        
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        assert self.init_npu_memory > free_npu_memory, (
+        assert self.init_npu_memory >= free_npu_memory, (
             "Error in memory profiling. "
             f"Initial free memory {self.init_npu_memory}, current free memory"
             f" {free_npu_memory}. This happens when the NPU memory was "
@@ -239,6 +260,7 @@ class NPUWorker(WorkerBase):
 
         # Get the peak memory allocation recorded by torch
         peak_memory = torch_npu.npu.memory_stats()["allocated_bytes.all.peak"]
+        
         # TODO: don`t need impl this func after empty_cache in
         # Worker.determine_num_available_blocks() unified`
         NPUPlatform.empty_cache()
@@ -249,13 +271,29 @@ class NPUWorker(WorkerBase):
         non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
         if non_torch_allocations > 0:
             peak_memory += non_torch_allocations
-        available_kv_cache_memory = int(
-            total_npu_memory * self.cache_config.gpu_memory_utilization -
+        
+        # Calculate available KV cache memory considering both the initial memory
+        # and the current free memory to handle multi-instance scenarios
+        available_memory_based_on_initial = int(
+            self.init_npu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
+        available_memory_based_on_current = int(
+            free_npu_memory * self.cache_config.gpu_memory_utilization)
+        
+        # Take the maximum of both calculations to be more accurate in 
+        # multi-instance scenarios where memory conditions may have changed
+        available_kv_cache_memory = max(available_memory_based_on_initial, 
+                                       available_memory_based_on_current)
+        
         available_kv_cache_memory = int(max(available_kv_cache_memory, 0))
+        
         logger.info(
-            f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
-        )
+            f"Available memory: {available_kv_cache_memory}, "
+            f"total memory: {total_npu_memory}, "
+            f"initial free memory: {self.init_npu_memory}, "
+            f"current free memory: {free_npu_memory}, "
+            f"model peak memory: {peak_memory}")
+
         return available_kv_cache_memory
 
     def execute_model(

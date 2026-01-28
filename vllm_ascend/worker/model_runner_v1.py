@@ -3544,15 +3544,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     error_code = '0x7020023'
                     pattern = r'retCode=([^,\s\.]+)'
                     match = re.search(pattern, error_msg)
+                    offset_error = "Offset increment outside graph capture" in error_msg
+                    
                     if match:
                         retCode = match.group(1)
                     # Determine whether the error message is caused by stream capture failure.
-                    if match and retCode == error_code:
+                    if match and retCode == error_code or offset_error:
                         logger.error(
                             f"ACLgraph sizes capture fail: {type(e).__name__}:\n"
                             "ACLgraph has insufficient available streams to capture the configured number of sizes. "
-                            "Trying with reduced number of sizes...\n\n"
+                            "Trying with reduced number of sizes and additional resource cleanup...\n\n"
                             f"{str(e)}")
+                        
+                        # Clear NPU cache to free up resources
+                        torch.npu.empty_cache()
+                        torch.npu.reset_peak_memory_stats()
                         
                         # Try with fewer sizes to reduce resource usage
                         try:
@@ -3574,7 +3580,24 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             logger.error(
                                 f"ACL graph capture failed even with reduced sizes: {type(retry_error).__name__}:\n"
                                 f"{str(retry_error)}")
-                            raise
+                            
+                            # If reduced sizes still fail, try with only the smallest sizes
+                            try:
+                                # Use only the smallest few sizes as ultimate fallback
+                                fallback_sizes = compilation_cases[:4] if len(compilation_cases) > 4 else compilation_cases
+                                logger.info(f"Using fallback ACL graph capture with minimal sizes: {fallback_sizes}")
+                                
+                                self._capture_aclgraphs(
+                                    fallback_sizes,
+                                    aclgraph_runtime_mode=aclgraph_runtime_mode,
+                                    uniform_decode=False)
+                                    
+                                logger.info("Successfully captured ACL graphs with fallback minimal sizes")
+                            except Exception as fallback_error:
+                                logger.error(
+                                    f"ACL graph capture failed with fallback sizes: {type(fallback_error).__name__}:\n"
+                                    f"{str(fallback_error)}")
+                                raise
                     else:
                         raise
 
@@ -3612,6 +3635,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def capture_model(self) -> None:
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
+
+        # Clean up resources before starting graph capture
+        torch.npu.empty_cache()
+        torch.npu.reset_peak_memory_stats()
 
         start_time = time.perf_counter()
         start_free_npu_memory = torch.npu.mem_get_info()[0]

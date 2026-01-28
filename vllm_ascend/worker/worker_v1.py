@@ -173,14 +173,6 @@ class NPUWorker(WorkerBase):
             # Enable optimizations for multi-instance scenarios
             logger.info("Multi-instance optimizations enabled for worker")
         
-        # Try to limit the number of streams to preserve resources for multi-instance scenarios
-        try:
-            # Configure torch to use a more conservative memory allocation strategy
-            # This helps prevent memory fragmentation and resource conflicts in multi-instance scenarios
-            torch.npu.set_limit_npu_ops_in_use(True)
-            logger.info("Enabled NPU ops limit for worker resource management")
-        except Exception as e:
-            logger.warning(f"Could not set NPU ops limit: {e}")
 
     def sleep(self, level: int = 1) -> None:
         if not sleep_mode_enabled():
@@ -263,53 +255,68 @@ class NPUWorker(WorkerBase):
         self.model_runner = NPUModelRunner(self.vllm_config, device)
 
     def determine_available_memory(self) -> int:
-        # Start from a clean state for accurate measurement.
+        # Profile the memory usage of the model and get the maximum number of
+        # cache blocks that can be allocated with the remaining free memory.
         NPUPlatform.clear_npu_memory()
         torch_npu.npu.reset_peak_memory_stats()
 
-        # Execute a forward pass with dummy inputs to profile the model's memory usage.
+        # Execute a forward pass with dummy inputs to profile the memory usage
+        # of the model.
         _, total_npu_memory = NPUPlatform.mem_get_info()
         self.model_runner.profile_run()
-        
+
         # Clear any temporary allocations after profiling run to get a cleaner peak reading.
         NPUPlatform.empty_cache()
         
         # Record the current free memory after profiling and cleanup.
         free_npu_memory, _ = NPUPlatform.mem_get_info()
-
-        # Assert that memory usage is consistent.
+        
+        # NOTE(woosuk): Here we assume that the other processes using the same
+        # GPU did not change their memory usage during the profiling.
         assert self.init_npu_memory >= free_npu_memory, (
-            "Error in memory profiling. Initial free memory "
-            f"{self.init_npu_memory} should be greater than or equal to "
-            f"current free memory {free_npu_memory}. This indicates improper "
-            "NPU memory cleanup.")
+            "Error in memory profiling. "
+            f"Initial free memory {self.init_npu_memory}, current free memory"
+            f" {free_npu_memory}. This happens when the NPU memory was "
+            "not properly cleaned up before initializing the vLLM instance.")
 
-        # Get the peak memory allocation recorded by PyTorch.
+        # Get the peak memory allocation recorded by torch
         peak_memory = torch_npu.npu.memory_stats()["allocated_bytes.all.peak"]
-
-        # Account for non-PyTorch NPU memory allocations.
+        
+        # Additional memory accounting for torch overhead and other allocations
         torch_allocated_bytes = torch_npu.npu.memory_stats()["allocated_bytes.all.current"]
         total_allocated_bytes = total_npu_memory - free_npu_memory
         non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
         if non_torch_allocations > 0:
             peak_memory += non_torch_allocations
-
-        # Calculate available KV cache memory using two strategies and take the maximum.
+        
+        # Apply a safety margin to account for memory fragmentation and 
+        # dynamic allocations during inference
+        memory_safety_margin = 0.05  # 5% safety margin
+        
+        # Calculate available KV cache memory considering both the initial memory
+        # and the current free memory to handle multi-instance scenarios
         available_memory_based_on_initial = int(
-            self.init_npu_memory * self.cache_config.gpu_memory_utilization - peak_memory)
-        available_memory_based_on_current = int(free_npu_memory * self.cache_config.gpu_memory_utilization)
-        available_kv_cache_memory = max(available_memory_based_on_initial, available_memory_based_on_current)
-
-        # Ensure the result is non-negative.
+            self.init_npu_memory * self.cache_config.gpu_memory_utilization * (1 - memory_safety_margin) -
+            peak_memory)
+        available_memory_based_on_current = int(
+            free_npu_memory * (self.cache_config.gpu_memory_utilization - memory_safety_margin))
+        
+        # Take the minimum of both calculations to be conservative and 
+        # prevent over-allocation in multi-instance scenarios
+        available_kv_cache_memory = min(available_memory_based_on_initial, 
+                                       available_memory_based_on_current)
+        
+        # Ensure we never return negative memory
         available_kv_cache_memory = max(available_kv_cache_memory, 0)
-
+        
         logger.info(
             "Memory profiling results: "
             f"available={available_kv_cache_memory / GiB_bytes:.2f}GiB, "
             f"total={total_npu_memory / GiB_bytes:.2f}GiB, "
             f"initial_free={self.init_npu_memory / GiB_bytes:.2f}GiB, "
             f"current_free={free_npu_memory / GiB_bytes:.2f}GiB, "
-            f"model_peak={peak_memory / GiB_bytes:.2f}GiB")
+            f"model_peak={peak_memory / GiB_bytes:.2f}GiB, "
+            f"safety_margin={(memory_safety_margin * 100):.0f}%")
 
         return available_kv_cache_memory
 

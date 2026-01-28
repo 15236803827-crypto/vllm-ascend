@@ -232,6 +232,13 @@ class NPUWorker(WorkerBase):
         NPUPlatform.empty_cache()
         torch_npu.npu.reset_peak_memory_stats()
         
+        # More thorough memory cleanup for multi-instance scenarios
+        import gc
+        gc.collect()
+        
+        # Wait a moment for memory to be fully released
+        time.sleep(0.1)
+        
         # Initialize unique memory pool context for this worker to avoid conflicts
         # Create a new context for memory allocation that is isolated from other workers
         try:
@@ -239,8 +246,8 @@ class NPUWorker(WorkerBase):
             torch.npu.set_per_process_memory_fraction(1.0, device=device)  # Use full memory for this process
         except Exception as e:
             logger.warning(f"Could not set memory fraction: {e}")
-            
-        # Get initial memory info after cleanup and isolation setup
+        
+        # Get memory info after cleanup for more accurate initial memory measurement
         self.init_npu_memory = NPUPlatform.mem_get_info()[0]
         
         # Initialize the distributed environment.
@@ -289,9 +296,9 @@ class NPUWorker(WorkerBase):
         if non_torch_allocations > 0:
             peak_memory += non_torch_allocations
         
-        # Apply a safety margin to account for memory fragmentation and 
-        # dynamic allocations during inference
-        memory_safety_margin = 0.05  # 5% safety margin
+        # Apply a larger safety margin to account for memory fragmentation and 
+        # dynamic allocations during inference, especially in multi-instance scenarios
+        memory_safety_margin = 0.10  # 10% safety margin to be more conservative
         
         # Calculate available KV cache memory considering both the initial memory
         # and the current free memory to handle multi-instance scenarios

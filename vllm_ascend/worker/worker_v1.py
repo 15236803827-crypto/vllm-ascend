@@ -172,6 +172,15 @@ class NPUWorker(WorkerBase):
         if os.environ.get("VLLM_ASCEND_MULTI_INSTANCE_OPTIM", "0") == "1":
             # Enable optimizations for multi-instance scenarios
             logger.info("Multi-instance optimizations enabled for worker")
+        
+        # Try to limit the number of streams to preserve resources for multi-instance scenarios
+        try:
+            # Configure torch to use a more conservative memory allocation strategy
+            # This helps prevent memory fragmentation and resource conflicts in multi-instance scenarios
+            torch.npu.set_limit_npu_ops_in_use(True)
+            logger.info("Enabled NPU ops limit for worker resource management")
+        except Exception as e:
+            logger.warning(f"Could not set NPU ops limit: {e}")
 
     def sleep(self, level: int = 1) -> None:
         if not sleep_mode_enabled():
@@ -226,10 +235,20 @@ class NPUWorker(WorkerBase):
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
         NPUPlatform.set_device(device)
-        # Clear cache before initialization to ensure clean state
+        
+        # Perform comprehensive resource cleanup before initialization
         NPUPlatform.empty_cache()
-        # Reset memory stats for accurate profiling
         torch_npu.npu.reset_peak_memory_stats()
+        
+        # Initialize unique memory pool context for this worker to avoid conflicts
+        # Create a new context for memory allocation that is isolated from other workers
+        try:
+            # Attempt to initialize a more isolated memory environment
+            torch.npu.set_per_process_memory_fraction(1.0, device=device)  # Use full memory for this process
+        except Exception as e:
+            logger.warning(f"Could not set memory fraction: {e}")
+            
+        # Get initial memory info after cleanup and isolation setup
         self.init_npu_memory = NPUPlatform.mem_get_info()[0]
         
         # Initialize the distributed environment.

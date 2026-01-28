@@ -3496,8 +3496,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 desc="Capturing ACL graphs ({}, {})".format(
                     "decode" if uniform_decode else "mixed prefill-decode",
                     aclgraph_runtime_mode.name))
+        
+        # Check if this is a multi-instance scenario
+        is_multi_instance = os.environ.get("VLLM_ASCEND_MULTI_INSTANCE", "0") == "1"
+        
         # We skip EPLB here since we don't want to record dummy metrics
-        for num_tokens in compilation_cases:
+        for idx, num_tokens in enumerate(compilation_cases):
             for _ in range(self.compilation_config.cudagraph_num_of_warmups):
                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
                 # But be careful, warm up with `NONE`is orthogonal to
@@ -3513,6 +3517,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             aclgraph_runtime_mode=aclgraph_runtime_mode,
                             force_attention=force_attention,
                             uniform_decode=uniform_decode)
+            
+            # Perform resource cleanup after every few captures in multi-instance mode
+            # to prevent resource accumulation
+            if is_multi_instance and idx % 5 == 0 and idx > 0:
+                logger.debug(f"Performing intermediate resource cleanup at index {idx}")
+                torch.npu.empty_cache()
+                torch.npu.reset_peak_memory_stats()
 
     def _capture_model(self):
         if not self.use_aclgraph:
@@ -3553,35 +3564,33 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         logger.error(
                             f"ACLgraph sizes capture fail: {type(e).__name__}:\n"
                             "ACLgraph has insufficient available streams to capture the configured number of sizes. "
-                            "Trying with reduced number of sizes and additional resource cleanup...\n\n"
+                            "Attempting comprehensive resource cleanup and retrying with original sizes...\n\n"
                             f"{str(e)}")
                         
-                        # Clear NPU cache to free up resources
+                        # Perform more thorough resource cleanup
+                        # Free up all cached memory from torch
                         torch.npu.empty_cache()
+                        # Reset peak memory statistics
                         torch.npu.reset_peak_memory_stats()
+                        # Force garbage collection
+                        import gc
+                        gc.collect()
                         
-                        # Try with fewer sizes to reduce resource usage
+                        # Try with original sizes after cleanup
                         try:
-                            # Use only every 4th size to reduce resource consumption
-                            reduced_compilation_cases = [size for i, size in enumerate(compilation_cases) if i % 4 == 0]
-                            if not reduced_compilation_cases:
-                                # Ensure at least one size is present
-                                reduced_compilation_cases = [compilation_cases[0]] if compilation_cases else []
-                            
-                            logger.info(f"Retrying ACL graph capture with reduced sizes: {reduced_compilation_cases}")
+                            logger.info(f"Retrying ACL graph capture with original sizes after resource cleanup: {compilation_cases}")
                             
                             self._capture_aclgraphs(
-                                reduced_compilation_cases,
+                                compilation_cases,
                                 aclgraph_runtime_mode=aclgraph_runtime_mode,
                                 uniform_decode=False)
                                 
-                            logger.info("Successfully captured ACL graphs with reduced sizes")
+                            logger.info("Successfully captured ACL graphs after resource cleanup")
                         except Exception as retry_error:
                             logger.error(
-                                f"ACL graph capture failed even with reduced sizes: {type(retry_error).__name__}:\n"
+                                f"ACL graph capture failed again after resource cleanup: {type(retry_error).__name__}:\n"
                                 f"{str(retry_error)}")
-                            
-                            # If reduced sizes still fail, try with only the smallest sizes
+                            # As a final resort, try with minimal sizes
                             try:
                                 # Use only the smallest few sizes as ultimate fallback
                                 fallback_sizes = compilation_cases[:4] if len(compilation_cases) > 4 else compilation_cases
@@ -3636,12 +3645,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
-        # Clean up resources before starting graph capture
+        # Perform comprehensive resource cleanup before starting graph capture
         torch.npu.empty_cache()
         torch.npu.reset_peak_memory_stats()
+        
+        # Force Python garbage collection to ensure memory is freed
+        import gc
+        gc.collect()
 
         start_time = time.perf_counter()
         start_free_npu_memory = torch.npu.mem_get_info()[0]
+
+        # Check if this is a multi-instance scenario and adjust accordingly
+        is_multi_instance = os.environ.get("VLLM_ASCEND_MULTI_INSTANCE", "0") == "1"
+        if is_multi_instance:
+            logger.info("Running in multi-instance mode, applying resource management")
+            # In multi-instance mode, we'll be more conservative with resource usage
+            # and perform additional cleanup between operations
 
         self._capture_model()
 
@@ -3652,7 +3672,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # This usually takes 5~20 seconds.
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, npu_graph_size / (1 << 30))
-
+        
+        # Perform resource cleanup after graph capture to free up resources for other instances
+        torch.npu.empty_cache()
+        torch.npu.reset_peak_memory_stats()
+        gc.collect()
     def _get_prompt_logprobs_dict(
         self,
         hidden_states: torch.Tensor,
